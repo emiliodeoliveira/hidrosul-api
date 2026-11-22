@@ -1,15 +1,19 @@
 import os
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.models import AlarmTest, ForecastResponse, Observation, Station
+from app.models import AlertSubscription, AlarmTest, ForecastResponse, Observation, Station
 from app.providers import (
     HydrowebProvider,
     InmetProvider,
     OpenMeteoProvider,
+    OnsProvider,
     SalaRsProvider,
 )
 
@@ -70,11 +74,20 @@ async def health() -> dict[str, str]:
 async def sources() -> dict[str, list[str]]:
     return {
         "sources": [
-            "ana-hidroweb",
-            "sala-rs",
-            "inmet",
             "open-meteo",
-        ]
+            "ons",
+            "inmet",
+        ],
+        "hydrological_fallback": [],
+        "reservoirs": ["ons"],
+        "meteorological": ["inmet", "open-meteo"],
+        "status": [
+            "open-meteo: operacional",
+            "ons: dados abertos de reservatórios; não substitui telemetria fluvial",
+            "inmet: dados meteorológicos por estação",
+            "ana-hidroweb: desativada até a configuração de token",
+            "sala-rs: desativada até disponibilização de uma fonte alternativa",
+        ],
     }
 
 
@@ -83,34 +96,38 @@ async def stations() -> list[Station]:
     return STATIONS
 
 
+@app.get("/api/v1/reservoirs")
+async def reservoirs() -> list[dict[str, str]]:
+    try:
+        return await OnsProvider().reservoirs()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Dados do ONS indisponíveis") from exc
+
+
+@app.get("/api/v1/reservoirs/{reservoir_code}/observations", response_model=list[Observation])
+async def reservoir_observations(
+    reservoir_code: str,
+    days: int = Query(default=7, ge=1, le=365),
+) -> list[Observation]:
+    try:
+        items = await OnsProvider().observations(reservoir_code, days)
+        if items:
+            return [Observation.model_validate(item) for item in items]
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Dados do ONS indisponíveis") from exc
+    raise HTTPException(status_code=404, detail="Nenhuma observação encontrada")
+
+
 @app.get("/api/v1/stations/{station_code}/observations", response_model=list[Observation])
 async def observations(
     station_code: str,
     days: int = Query(default=7, ge=1, le=365),
-    source: Literal["auto", "ana-hidroweb", "sala-rs", "inmet"] = "auto",
+    source: Literal["disabled"] = "disabled",
 ) -> list[Observation]:
-    providers = {
-        "sala-rs": SalaRsProvider(),
-        "ana-hidroweb": HydrowebProvider(),
-        "inmet": InmetProvider(),
-    }
-
-    order = list(providers) if source == "auto" else [source]
-    errors = []
-    for provider_name in order:
-        try:
-            items = await providers[provider_name].observations(station_code, days)
-            if items:
-                return [Observation.model_validate(item) for item in items]
-        except (httpx.HTTPError, ValueError) as exc:
-            errors.append(f"{provider_name}: {type(exc).__name__}")
-
-    if errors:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Dados indisponíveis nas fontes configuradas ({'; '.join(errors)})",
-        )
-    raise HTTPException(status_code=404, detail="Nenhuma observação encontrada")
+    raise HTTPException(
+        status_code=503,
+        detail="Telemetria fluvial desativada: ANA/HidroWeb requer token e nenhuma fonte alternativa foi configurada",
+    )
 
 
 @app.get("/api/v1/weather/forecast", response_model=ForecastResponse)
@@ -124,6 +141,68 @@ async def weather_forecast(
         return ForecastResponse.model_validate(payload)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Previsão meteorológica indisponível") from exc
+
+
+@app.get("/api/v1/weather/observations")
+async def weather_observations(
+    station_code: str = Query(default="A801"),
+    days: int = Query(default=7, ge=1, le=365),
+) -> list[dict[str, str | float | None]]:
+    try:
+        items = await InmetProvider().observations(station_code, days)
+        if items:
+            return items
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Observações meteorológicas do INMET indisponíveis") from exc
+    raise HTTPException(status_code=404, detail="Nenhuma observação meteorológica encontrada")
+
+
+@app.post("/api/v1/alerts/subscriptions")
+async def subscribe_alert(subscription: AlertSubscription) -> dict[str, str | bool]:
+    email = subscription.email.strip() if subscription.email else ""
+    phone = subscription.phone.strip() if subscription.phone else ""
+    if not email and not phone:
+        raise HTTPException(
+            status_code=422,
+            detail="Informe um e-mail ou telefone.",
+        )
+
+    storage_path = Path(
+        os.getenv("HIDROSUL_SUBSCRIPTION_FILE", "subscriptions.json")
+    )
+    subscriptions = []
+    if storage_path.exists():
+        try:
+            subscriptions = json.loads(storage_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            subscriptions = []
+
+    record = subscription.model_dump(mode="json")
+    record["email"] = email or None
+    record["phone"] = phone or None
+    record["created_at"] = datetime.now(timezone.utc).isoformat()
+
+    for existing in subscriptions:
+        if (
+            existing.get("city") == subscription.city
+            and (existing.get("email") == email or existing.get("phone") == phone)
+            and existing.get("condition") == subscription.condition
+        ):
+            return {
+                "subscribed": True,
+                "message": f"Inscrição já cadastrada para {subscription.city}.",
+            }
+
+    subscriptions.append(record)
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_path.write_text(
+        json.dumps(subscriptions, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "subscribed": True,
+        "message": f"Inscrição criada para {subscription.city}.",
+    }
 
 
 @app.post("/api/v1/alarms/test")

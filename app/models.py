@@ -40,3 +40,12 @@ class ForecastResponse(BaseModel):
 class AlarmTest(BaseModel):
     station_code: str = Field(min_length=1)
     level_m: float = Field(ge=0)
+
+
+class AlertSubscription(BaseModel):
+    city: str = Field(min_length=1)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    email: str | None = None
+    phone: str | None = None
+    condition: str = Field(min_length=1)

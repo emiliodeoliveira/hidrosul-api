@@ -1,4 +1,6 @@
 import os
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -101,6 +103,71 @@ class SalaRsProvider:
         return normalized
 
 
+class OnsProvider:
+    name = "ons"
+
+    def __init__(self) -> None:
+        self.base_url = os.getenv(
+            "ONS_BASE_URL",
+            "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/dados_hidrologicos_di",
+        ).rstrip("/")
+
+    async def reservoirs(self) -> list[dict[str, Any]]:
+        year = datetime.now().year
+        url = f"{self.base_url}/DADOS_HIDROLOGICOS_RES_{year}.csv"
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+
+        reader = csv.DictReader(io.StringIO(response.text), delimiter=";")
+        reservoirs: dict[str, dict[str, Any]] = {}
+        for item in reader:
+            code = str(item.get("id_reservatorio", "")).strip()
+            name = str(item.get("nom_reservatorio", "")).strip()
+            if code and code not in reservoirs:
+                reservoirs[code] = {
+                    "code": code,
+                    "name": name,
+                    "basin": str(item.get("nom_bacia", "")).strip(),
+                    "subsystem": str(item.get("nom_subsistema", "")).strip(),
+                }
+        return list(reservoirs.values())
+
+    async def observations(self, reservoir_code: str, days: int) -> list[dict[str, Any]]:
+        year = datetime.now().year
+        url = f"{self.base_url}/DADOS_HIDROLOGICOS_RES_{year}.csv"
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+
+        cutoff = datetime.now().date() - timedelta(days=days)
+        normalized = []
+        reader = csv.DictReader(io.StringIO(response.text), delimiter=";")
+        for item in reader:
+            if str(item.get("id_reservatorio", "")).strip() != reservoir_code:
+                continue
+            date_value = str(item.get("din_instante", "")).strip()
+            level_value = str(item.get("val_nivelmontante", "")).strip()
+            if not date_value or not level_value:
+                continue
+            observed_at = datetime.strptime(date_value, "%Y-%m-%d").date()
+            if observed_at < cutoff:
+                continue
+            discharge_value = str(item.get("val_vazaodefluente", "")).strip()
+            normalized.append({
+                "station_code": reservoir_code,
+                "timestamp": datetime.combine(observed_at, datetime.min.time()).isoformat(),
+                "level_m": float(level_value.replace(",", ".")),
+                "discharge_m3s": (
+                    float(discharge_value.replace(",", "."))
+                    if discharge_value
+                    else None
+                ),
+                "source": self.name,
+            })
+        return normalized
+
+
 class InmetProvider:
     name = "inmet"
 
@@ -113,7 +180,10 @@ class InmetProvider:
     async def observations(self, station_code: str, days: int) -> list[dict[str, Any]]:
         end = datetime.now().date()
         start = end - timedelta(days=days)
-        url = f"{self.base_url}/estacao/dados/{station_code}"
+        url = (
+            f"{self.base_url}/estacao/dados/"
+            f"{station_code}/{start.isoformat()}/{end.isoformat()}"
+        )
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             response = await client.get(url)
             response.raise_for_status()
